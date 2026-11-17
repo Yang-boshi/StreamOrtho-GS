@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+
+# Run outputs
+results/
+runs/
+
+# Model weights (never commit)
+*.pth
+*.ckpt
+*.safetensors
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

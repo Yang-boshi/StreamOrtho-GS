@@ -1,0 +1,77 @@
+data:
+  images: ""
+  image_size: 512
+  stride: 1
+  intrinsics: auto          # auto | exif | provided | none
+  intrinsics_value: null    # [fx, fy, cx, cy] when provided
+  max_frames: 0
+
+frontend:
+  backend: mast3r_slam
+  use_calib: auto
+  keyframe_policy: default
+  single_thread: false
+
+filter:
+  enabled: true
+  gate: true
+  nfp: true
+  prune: false
+  min_conf: 0.5
+  depth_min_m: 5.0
+  depth_max_m: 1500.0
+  height_min_m: -3.0
+  height_max_m: 120.0
+  iso_radius_m: 1.5
+  iso_conf_max: 1.2
+  curtain_ratio: 4.0
+  max_prune_frac: 0.35
+  nfp_mode: above
+  nfp_tau_m: 4.0
+  nfp_top_pct: 90
+  nfp_min_obs: 2
+  protect_unique: true
+  protect_low_obs: true
+  nfp_below_min_gap_m: 1.5
+
+gaussian:
+  enabled: true
+  head_ckpt: ""
+  keyframes_only: true
+  anchor: head
+  apply_filter: true
+
+map:
+  cell: 0.45
+  z_gap: 2.0
+  max_layers: 3
+  freeze_owner: true
+  online_calib: true
+  window: 0
+  window_every: 5
+  window_rounds: 2
+
+ortho:
+  gsd: 0.30
+  tile: 512
+  render: hybrid
+  fov_only: true
+  dirty_tiles: true
+  budget_ms: 500
+  max_tiles: 6
+  dump_every: 10
+  edge_pct: 85
+  edge_dilate: 2
+
+offline:
+  enabled: true
+  iters: 3
+  model: hybrid
+  lam_p: 0.1
+  render_texture: true
+
+output:
+  save_tiles: true
+  save_product: true
+  save_mosaic: true
+  save_json: true

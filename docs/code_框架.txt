@@ -1,0 +1,11 @@
+3DGS：
+① predict.encode_image        关键帧缩到 512 长边 → MASt3R 编码
+② predict.predict_gaussians   Gaussian head → 每像素 means/scales(exp)/quats/opacity/sh
+③ map/build.py                三种初始化：
+     head_patch         : means=head 深度（对齐点图尺度），颜色=512 图
+     plane_patch        : means=射线∩平面/DSM，颜色=全分辨率图，σ=depth/fx·stride
+     head_adapt_patch   : means=射线×清洗后深度（全分辨率），颜色=全分辨率图，σ≈1px，盘状
+④ GaussianMap.ingest          0.25–0.4 m 体素去重；命中旧点 → _bulk_merge：
+                              means/colors/scales/opacity 全部**加权平均**
+⑤ GaussianMap.commit          staged 里 n_obs≥2 或 age≥2 并入 committed（再平均一次）
+⑥ rasterizer.render_tile      gsplat 正交光栅化 + alpha 归一

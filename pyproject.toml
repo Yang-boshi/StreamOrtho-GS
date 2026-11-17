@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ortho-3dgs"
+version = "0.4.0"
+description = "Streaming feed-forward 2.5D orthomapping with a 3DGS high-resolution final ortho"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT (this repository); upstream components keep their own licences" }
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pillow>=9.5",
+  "pyyaml>=6.0",
+  "torch>=2.0",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# the live front-end is optional: it needs the vendored third_party/MASt3R-SLAM on sys.path
+live = []
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+stream-ortho = "stream_ortho.app.run:main"
+
+[tool.setuptools.packages.find]
+include = ["stream_ortho*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
