@@ -68,33 +68,71 @@ def source_gsd(X_canon, T_WC) -> float:
     return float(np.median(X_canon[..., 2])) / effective_fx(X_canon) * float(s)
 
 
+def _load_dataset_for_run(run_dir: pathlib.Path, info: dict):
+    ds_dir = pathlib.Path(info.get("dataset_dir", ""))
+    if not ds_dir.exists():
+        ds_dir = zcfg.DATA_DIR / info["dataset"]
+    if (ds_dir / "config.cfg").exists():
+        return NPUDroneMapDataset(str(ds_dir))
+    from stream_ortho.data.rgb_folder import RGBFolderDataset
+    return RGBFolderDataset(str(ds_dir), intrinsics="auto")
+
+
+def _resolve_plane_aligner(run_dir: pathlib.Path, npz, kf_indices, ds):
+    """Load alignment.json if present, or estimate leveled ProgressivePlaneAligner."""
+    from stream_ortho.app.alignment import ProgressivePlaneAligner
+    align_path = run_dir / "alignment.json"
+    if align_path.exists():
+        adata = json.loads(align_path.read_text())
+        if "T_PW" in adata:
+            T_PW = np.asarray(adata["T_PW"], dtype=np.float64)
+            T_WP = np.linalg.inv(T_PW)
+        elif "T_WP" in adata:
+            # Legacy alignment.py saved World->Plane under "T_WP"
+            T_PW = np.asarray(adata["T_WP"], dtype=np.float64)
+            T_WP = np.linalg.inv(T_PW)
+        else:
+            T_WP = None
+        if T_WP is not None:
+            return ProgressivePlaneAligner(mode="plane", T_WP=T_WP)
+
+    aligner = ProgressivePlaneAligner(mode="auto", bootstrap_kfs=min(2, len(kf_indices)))
+    for k in kf_indices[:2]:
+        R, t, sc = sim3_from_vec8(npz["T_WC"][k])
+        pts = npz["X_canon"][k].reshape(-1, 3).astype(np.float64)
+        Pw = float(sc) * (pts @ R.T) + t
+        if aligner.add(Pw, cam_pos=t):
+            break
+    return aligner
+
+
 def accumulate_keyframes(run_dir, kf_indices, ds, tile_pad_px: int = 16,
                          floor_mul: float = 1.0, device: str = "cuda:0",
                          log=print, snap_dir=None, collect_ply: bool = False,
                          conf_threshold: float = 0.5) -> dict:
-    """Render every keyframe's Gaussians onto one anchored canvas.
+    """Render every keyframe's Gaussians onto one anchored canvas."""
+    from stream_ortho.scripts.export_3dgs_ply import quat_rotate_batch
 
-    Returns dict with per-keyframe canvas-aligned ``(rgb, alpha, meta)`` plus
-    the union coverage, the plane extent and the GSD actually used (median of
-    the per-keyframe source GSDs).
-
-    ``snap_dir``: if set, save each keyframe's content-cropped snapshot
-    (RGB over a white background) + content box there, for the update video.
-    ``collect_ply``: also return the plane-frame Gaussian arrays (concatenated)
-    for the 3DGS PLY export.
-    """
+    run_dir = pathlib.Path(run_dir)
     npz = np.load(run_dir / "keyframes.npz")
     n_kf = len(npz["frame_id"])
     kf_indices = [i for i in kf_indices if 0 <= i < n_kf]
     if not kf_indices:
         raise ValueError("no valid keyframe indices")
 
-    # ---- pass 1: adapter per keyframe, collect plane extents -----------------
+    aligner = _resolve_plane_aligner(run_dir, npz, kf_indices, ds)
+    all_s = np.asarray(npz["T_WC"][kf_indices, 7], dtype=np.float64)
+    med_s = float(np.median(all_s)) if all_s.size else 1.0
+
+    # ---- pass 1: adapter per keyframe, collect leveled plane extents ----------
     per_kf = []
     ply_acc = {"means": [], "sh": [], "opac": [], "scales": [], "quats": [],
                "kf": []} if collect_ply else None
-    T_PW = np.linalg.inv(ds.T_WP)
     for k in kf_indices:
+        _, _, sc = sim3_from_vec8(npz["T_WC"][k])
+        if sc < 0.45 * med_s:
+            log(f"[run_p5] kf {k}: skipping scale-collapsed landing frame (s={sc:.3f} vs med {med_s:.3f})")
+            continue
         frame_id = int(npz["frame_id"][k])
         img = ds.read_img(frame_id)
         t0 = time.time()
@@ -102,25 +140,27 @@ def accumulate_keyframes(run_dir, kf_indices, ds, tile_pad_px: int = 16,
                             gate_only=True)
         g = mast3r_anchored_gaussians(
             img_u8=img, X_canon=npz["X_canon"][k], sim3_vec=npz["T_WC"][k],
-            T_WP=ds.T_WP, keyframe_id=frame_id, device=device, filter_cfg=filt)
-        means_np = g.means.detach().cpu().numpy()
-        mp = (T_PW @ np.concatenate([means_np, np.ones((len(means_np), 1))], 1).T).T[:, :3]
+            T_WP=aligner.T_WP_mat, keyframe_id=frame_id, device=device, filter_cfg=filt)
+        means_np = g.means.detach().cpu().numpy().astype(np.float64)
+        conf_np = g.confidence.detach().cpu().numpy().ravel()
+        mp, T_PW_kf, _ = aligner.rectify_keyframe(k, means_np, conf=conf_np)
         ext = mp[:, :2].max(0) - mp[:, :2].min(0)
         per_kf.append({
             "kf": k, "frame_id": frame_id, "g": g, "mp": mp, "ext": ext,
+            "T_WP_kf": np.linalg.inv(T_PW_kf),
             "centre": mp[:, :2].mean(0), "z_max": float(mp[:, 2].max()),
             "gsd": source_gsd(npz["X_canon"][k], npz["T_WC"][k]),
             "img": img, "t_adapter": time.time() - t0,
         })
         if ply_acc is not None:
-            # plane-frame copy for the PLY export (quats rotated by R_WP)
-            from stream_ortho.scripts.export_3dgs_ply import quat_rotate_batch
+            sc_lin = np.clip(g.scales.detach().cpu().numpy().astype(np.float32), 1e-7, None)
+            op_lin = np.clip(g.opacity.detach().cpu().numpy().astype(np.float32), 1e-4, 1.0 - 1e-4)
             ply_acc["means"].append(mp.astype(np.float32))
             ply_acc["sh"].append(g.sh_dc.detach().cpu().numpy().astype(np.float32))
-            ply_acc["opac"].append(g.opacity.detach().cpu().numpy().astype(np.float32))
-            ply_acc["scales"].append(g.scales.detach().cpu().numpy().astype(np.float32))
+            ply_acc["opac"].append(np.log(op_lin / (1.0 - op_lin)).astype(np.float32))
+            ply_acc["scales"].append(np.log(sc_lin).astype(np.float32))
             ply_acc["quats"].append(quat_rotate_batch(
-                g.quats.detach().cpu().numpy().astype(np.float64), ds.T_WP[:3, :3]).astype(np.float32))
+                g.quats.detach().cpu().numpy().astype(np.float64), T_PW_kf[:3, :3]).astype(np.float32))
             ply_acc["kf"].append(np.full(len(means_np), frame_id, np.int32))
         log(f"[run_p5] kf {k} (frame {frame_id}): {g.means.shape[0]} gaussians, "
             f"ext {ext[0]:.2f}x{ext[1]:.2f}m, adapter {per_kf[-1]['t_adapter']:.2f}s")
@@ -145,7 +185,7 @@ def accumulate_keyframes(run_dir, kf_indices, ds, tile_pad_px: int = 16,
         cx, cy = float(p["centre"][0]), float(p["centre"][1])
         t0 = time.time()
         rgb, alpha, _ = render_ortho_tile(
-            p["g"], ds.T_WP, cx, cy, p["z_max"], gsd=gsd, tile_size=size,
+            p["g"], p["T_WP_kf"], cx, cy, p["z_max"], gsd=gsd, tile_size=size,
             scale_floor=float(np.sqrt(float(ext[0] * ext[1]) / p["g"].means.shape[0]) * floor_mul),
             device=device)
         t_render = time.time() - t0
@@ -267,7 +307,7 @@ def render_3dgs_final(run_dir, out_dir=None, gsd: float = 0.0, conf_threshold: f
     n_available = len(npz["frame_id"])
     kfs = list(range(min(max_kf, n_available)) if max_kf else range(n_available))
     info = json.loads((run_dir / "run.json").read_text())
-    ds = NPUDroneMapDataset(str(zcfg.DATA_DIR / info["dataset"]))
+    ds = _load_dataset_for_run(run_dir, info)
 
     log(f"[3dgs] {len(kfs)} keyframes from {run_dir}")
     t0 = time.time()
@@ -342,7 +382,7 @@ def main(argv=None):
 
     run_dir = pathlib.Path(a.run)
     info = json.loads((run_dir / "run.json").read_text())
-    ds = NPUDroneMapDataset(zcfg.DATA_DIR / info["dataset"])
+    ds = _load_dataset_for_run(run_dir, info)
     npz = np.load(run_dir / "keyframes.npz")
     kfs = parse_kf_range(a.kfs, len(npz["frame_id"]))
     print(f"[run_p5] {len(kfs)} keyframes from {run_dir}")

@@ -17,10 +17,11 @@ def test_defaults_are_valid():
     assert cfg.filter.enabled is True
 
 
-def test_load_default_yaml():
-    cfg = load_config(CFG_DIR / "default.yaml")
+def test_load_base_yaml():
+    cfg = load_config(CFG_DIR / "base.yaml")
     assert cfg.map.cell == 0.45
     assert cfg.ortho.gsd == 0.30
+    assert cfg.gaussian.streaming_3dgs is True
 
 
 def test_unknown_key_raises(tmp_path):
@@ -37,10 +38,16 @@ def test_unknown_section_raises(tmp_path):
         load_config(p)
 
 
-def test_ablation_configs_flip_one_switch():
-    a = load_config(CFG_DIR / "ablation_no_filter.yaml")
-    b = load_config(CFG_DIR / "ablation_no_freeze.yaml")
-    c = load_config(CFG_DIR / "ablation_offline_only.yaml")
+def test_ablation_configs_flip_one_switch(tmp_path):
+    p_a = tmp_path / "no_filter.yaml"
+    p_b = tmp_path / "no_freeze.yaml"
+    p_c = tmp_path / "offline_only.yaml"
+    p_a.write_text("filter:\n  enabled: false\n")
+    p_b.write_text("map:\n  freeze_owner: false\n")
+    p_c.write_text("map:\n  online_calib: false\n")
+    a = load_config(p_a)
+    b = load_config(p_b)
+    c = load_config(p_c)
     assert a.filter.enabled is False and a.map.freeze_owner is True
     assert b.map.freeze_owner is False and b.filter.enabled is True
     assert c.map.online_calib is False
@@ -58,3 +65,17 @@ def test_provided_intrinsics_requires_values(tmp_path):
     p.write_text("data:\n  intrinsics: provided\n")
     with pytest.raises(ConfigError):
         load_config(p)
+
+
+def test_config_proj_override_resolves_checkpoints(monkeypatch, tmp_path):
+    import importlib
+    from stream_ortho import config as zcfg
+
+    monkeypatch.setenv("ORTHO_PROJ", str(tmp_path))
+    importlib.reload(zcfg)
+    try:
+        assert zcfg.PROJ == tmp_path
+        assert zcfg.CKPT_DIR == tmp_path / "checkpoints"
+    finally:
+        monkeypatch.delenv("ORTHO_PROJ", raising=False)
+        importlib.reload(zcfg)

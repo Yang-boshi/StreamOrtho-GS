@@ -16,10 +16,17 @@ import pathlib
 PKG_DIR = pathlib.Path(__file__).resolve().parent          # .../Ortho-3dgs/stream_ortho
 REPO_DIR = PKG_DIR.parent                                   # .../Ortho-3dgs (repo root)
 
-# Project root holding external data / checkpoints / results.  Defaults to the
-# parent of the repo checkout; override with the ``ORTHO_PROJ`` environment
-# variable when the repo lives elsewhere (e.g. a plain GitHub clone).
-PROJ = pathlib.Path(os.environ.get("ORTHO_PROJ", REPO_DIR.parent.parent))
+# Project root holding external data / checkpoints / results.
+# Precedence: ORTHO_PROJ env var -> <repo>/checkpoints (standalone clone) ->
+# ../../checkpoints (workspace layout PROJ/code/Ortho-3dgs) -> <repo>.
+if "ORTHO_PROJ" in os.environ:
+    PROJ = pathlib.Path(os.environ["ORTHO_PROJ"])
+elif (REPO_DIR / "checkpoints").is_dir():
+    PROJ = REPO_DIR
+elif (REPO_DIR.parent.parent / "checkpoints").is_dir():
+    PROJ = REPO_DIR.parent.parent
+else:
+    PROJ = REPO_DIR
 
 # Vendored upstream checkout (carries our 2-file patch: jpg loader + pose hook).
 MAST3R_SLAM_DIR = REPO_DIR / "third_party" / "MASt3R-SLAM"

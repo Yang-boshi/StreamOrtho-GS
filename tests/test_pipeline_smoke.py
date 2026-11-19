@@ -23,7 +23,10 @@ def _images(tmp_path, n=10, size=(72, 96)):
 def test_one_command_runs_and_writes_config(tmp_path):
     root = _images(tmp_path)
     out = tmp_path / "out"
-    cfg = pathlib.Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
+    base_cfg = pathlib.Path(__file__).resolve().parents[1] / "configs" / "base.yaml"
+    assert main(["--config", str(base_cfg), "--dry-run"]) == 0
+    cfg = tmp_path / "smoke.yaml"
+    cfg.write_text("frontend:\n  backend: replay\n")
     rc = main(["--config", str(cfg), "--images", str(root), "--out", str(out),
                "--max-frames", "10", "--intrinsics", "none"])
     assert rc == 0

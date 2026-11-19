@@ -5,22 +5,30 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ortho-3dgs"
 version = "0.4.0"
-description = "Streaming feed-forward 2.5D orthomapping with a 3DGS high-resolution final ortho"
+description = "Orthographic-sufficient streaming feed-forward 3DGS orthomapping from monocular UAV video"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT (this repository); upstream components keep their own licences" }
 dependencies = [
-  "numpy>=1.24",
+  "numpy>=1.24,<2",
   "scipy>=1.10",
   "pillow>=9.5",
   "pyyaml>=6.0",
   "torch>=2.0",
+  "torchvision>=0.15",
   "matplotlib>=3.7",
+  "opencv-python>=4.8",
+  "plyfile>=1.0",
+  "einops>=0.7",
+  "roma>=1.4",
+  "scikit-learn>=1.3",
+  "huggingface-hub>=0.22",
+  "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
-# the live front-end is optional: it needs the vendored third_party/MASt3R-SLAM on sys.path
-live = []
+# Full live E2E pipeline also requires CUDA extensions built from third_party/MASt3R-SLAM + ninja
+live = ["gsplat>=1.4", "ninja>=1.11"]
 dev = ["pytest>=7.4"]
 
 [project.scripts]

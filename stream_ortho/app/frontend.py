@@ -25,7 +25,7 @@ class FramePacket:
     cos_inc: np.ndarray
     rgb: np.ndarray | None = None
     is_keyframe: bool = True
-    #: present on the live path so the offline stage / carving can reproject
+    #: present on the live path so the offline stage / carving / 3DGS can reuse
     T_WC: np.ndarray | None = None
     K: np.ndarray | None = None
     C: np.ndarray | None = None
@@ -33,6 +33,12 @@ class FramePacket:
     x_hw: tuple | None = None
     c_hw: tuple | None = None
     use_calib: bool | None = None
+    img_u8: np.ndarray | None = None
+    K_orig: np.ndarray | None = None
+    feat: object | None = None
+    pos: object | None = None
+    shape_hw: tuple | None = None
+    model: object | None = None
 
 
 class ReplayFrontend:
@@ -73,7 +79,7 @@ class LiveFrontend:
     """
 
     def __init__(self, dataset_dir, out_dir, calib=False, max_frames=0, stride=1,
-                 single_thread=False, hook=None):
+                 single_thread=False, hook=None, intrinsics="auto", intrinsics_value=None):
         # the SLAM loop changes the process cwd, so keep an absolute path
         import pathlib as _pl
         self.dataset_dir = str(_pl.Path(dataset_dir).resolve())
@@ -83,6 +89,8 @@ class LiveFrontend:
         self.stride = int(stride)
         self.single_thread = bool(single_thread)
         self.hook = hook
+        self.intrinsics = str(intrinsics)
+        self.intrinsics_value = intrinsics_value
         self.packets = 0
 
     def _make_hook(self, callback):
@@ -127,6 +135,7 @@ class LiveFrontend:
                 raise RuntimeError(f"confidence shape {Cg.shape} cannot be aligned to N={N}")
             assert C.size == N
 
+            img_full = None
             rgb = None
             try:
                 img = self._reader.read_img(int(frame.frame_id))
@@ -135,6 +144,7 @@ class LiveFrontend:
                 remap = getattr(getattr(self._reader, "camera_intrinsics", None), "remap", None)
                 if remap is not None:
                     img = remap(img)
+                img_full = img
                 import cv2 as _cv
                 small = _cv.resize(img, (wx, hx), interpolation=_cv.INTER_AREA)
                 rgb = np.asarray(small, np.float32).reshape(-1, 3)
@@ -145,13 +155,26 @@ class LiveFrontend:
                     print(f"[kf-colour] {exc!r}", flush=True)
                 rgb = None
 
+            from stream_ortho.scripts import run_mast3r_baseline as _RMB
+            K_orig = getattr(self._reader, "K_orig", None)
+            if K_orig is None and hasattr(self._reader, "K"):
+                K_orig = self._reader.K
+            fk = getattr(frame, "K", None)
+            if fk is not None and hasattr(fk, "detach"):
+                fk = fk.detach().cpu().numpy()
             packet = FramePacket(
                 kf=int(k), frame_id=int(frame.frame_id), x=X[:, 0], y=X[:, 1], z=X[:, 2],
                 conf=C, depth=X[:, 2], cos_inc=np.ones(N), is_keyframe=True, rgb=rgb,
                 T_WC=_frame_pose(frame),
-                K=np.asarray(frame.K, np.float64) if hasattr(frame, "K") else None,
+                K=np.asarray(fk, np.float64) if fk is not None else None,
                 C=C, N=float(getattr(frame, "N", 1)),
-                x_hw=(hx, wx), c_hw=tuple(int(v) for v in Cg.shape), use_calib=self.calib)
+                x_hw=(hx, wx), c_hw=tuple(int(v) for v in Cg.shape), use_calib=self.calib,
+                img_u8=img_full,
+                K_orig=(None if K_orig is None else np.asarray(K_orig, np.float64)),
+                feat=getattr(frame, "feat", None),
+                pos=getattr(frame, "pos", None),
+                shape_hw=(hx, wx),
+                model=_RMB.ACTIVE_MODEL)
             self.packets += 1
             callback(packet)
         return _hook
@@ -160,19 +183,27 @@ class LiveFrontend:
         """A dataset used only to fetch RGB colours for the packets."""
         from stream_ortho.data.npu_dataset import NPUDroneMapDataset
         try:
-            return NPUDroneMapDataset(self.dataset_dir, stride=self.stride)
+            return NPUDroneMapDataset(self.dataset_dir, stride=self.stride, use_calib=self.calib)
         except Exception:
             from stream_ortho.data.rgb_folder import RGBFolderDataset
-            return RGBFolderDataset(self.dataset_dir, intrinsics="none", stride=self.stride)
+            return RGBFolderDataset(
+                self.dataset_dir,
+                intrinsics=self.intrinsics,
+                intrinsics_value=self.intrinsics_value,
+                stride=self.stride,
+            )
 
-    def run(self, callback):
+    def run(self, callback, pose_callback=None):
         from stream_ortho.scripts import run_mast3r_baseline as R
         self._reader = self._open_reader()
         R.KEYFRAME_HOOK = self._make_hook(callback)
+        R.POSE_UPDATE_HOOK = pose_callback
         import pathlib as _pl
         fmt = "npu" if (_pl.Path(self.dataset_dir) / "config.cfg").exists() else "rgb"
         argv = ["--dataset", self.dataset_dir, "--out", self.out_dir,
-                "--dataset-format", fmt]
+                "--dataset-format", fmt, "--intrinsics", self.intrinsics]
+        if self.intrinsics_value:
+            argv += ["--intrinsics-value", ",".join(str(v) for v in self.intrinsics_value)]
         if self.calib:
             argv.append("--calib")
         if self.max_frames:
@@ -185,4 +216,6 @@ class LiveFrontend:
             R.main(argv)
         finally:
             R.KEYFRAME_HOOK = None
+            R.POSE_UPDATE_HOOK = None
+            R.ACTIVE_MODEL = None
         return self.packets

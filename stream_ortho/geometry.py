@@ -132,6 +132,23 @@ def sim3_act_inv(vec, pts) -> np.ndarray:
 # Gaussian world transform (torch)
 # ---------------------------------------------------------------------------
 
+def quat_rotate_batch_torch(quats_wxyz, R):
+    """Rotate a batch of ``(N, 4)`` wxyz torch quaternions by ``(3, 3)`` matrix ``R``."""
+    import torch
+
+    qt = quats_wxyz.reshape(-1, 4)
+    if qt.numel() == 0:
+        return qt
+    q_R = torch.as_tensor(R_to_quat_wxyz(R), dtype=qt.dtype, device=qt.device).expand_as(qt)
+    qw = torch.stack([
+        q_R[:, 0] * qt[:, 0] - q_R[:, 1] * qt[:, 1] - q_R[:, 2] * qt[:, 2] - q_R[:, 3] * qt[:, 3],
+        q_R[:, 0] * qt[:, 1] + q_R[:, 1] * qt[:, 0] + q_R[:, 2] * qt[:, 3] - q_R[:, 3] * qt[:, 2],
+        q_R[:, 0] * qt[:, 2] - q_R[:, 1] * qt[:, 3] + q_R[:, 2] * qt[:, 0] + q_R[:, 3] * qt[:, 1],
+        q_R[:, 0] * qt[:, 3] + q_R[:, 1] * qt[:, 2] - q_R[:, 2] * qt[:, 1] + q_R[:, 3] * qt[:, 0],
+    ], dim=-1)
+    return qw / qw.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
 def transform_gaussians_to_world(mu_cam, quats_wxyz, scales, sim3_vec, device="cuda"):
     """Camera-frame Gaussians -> world frame (full Sim3, scale-aware).
 
@@ -143,7 +160,6 @@ def transform_gaussians_to_world(mu_cam, quats_wxyz, scales, sim3_vec, device="c
     R, t, s = sim3_from_vec8(sim3_vec)
     Rt = torch.as_tensor(R, dtype=torch.float32, device=device)
     tt = torch.as_tensor(t, dtype=torch.float32, device=device)
-    q_R = torch.as_tensor(R_to_quat_wxyz(R), dtype=torch.float32, device=device)  # wxyz!
 
     mu = mu_cam.reshape(-1, 3).to(device, torch.float32)
     sc = scales.reshape(-1, 3).to(device, torch.float32)
@@ -152,15 +168,7 @@ def transform_gaussians_to_world(mu_cam, quats_wxyz, scales, sim3_vec, device="c
 
     mu_w = float(s) * (mu @ Rt.T) + tt
     sc_w = sc * float(s)
-
-    q_R = q_R.expand_as(qt)
-    qw = torch.stack([
-        q_R[:, 0] * qt[:, 0] - q_R[:, 1] * qt[:, 1] - q_R[:, 2] * qt[:, 2] - q_R[:, 3] * qt[:, 3],
-        q_R[:, 0] * qt[:, 1] + q_R[:, 1] * qt[:, 0] + q_R[:, 2] * qt[:, 3] - q_R[:, 3] * qt[:, 2],
-        q_R[:, 0] * qt[:, 2] - q_R[:, 1] * qt[:, 3] + q_R[:, 2] * qt[:, 0] + q_R[:, 3] * qt[:, 1],
-        q_R[:, 0] * qt[:, 3] + q_R[:, 1] * qt[:, 2] - q_R[:, 2] * qt[:, 1] + q_R[:, 3] * qt[:, 0],
-    ], dim=-1)
-    qw = qw / qw.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    qw = quat_rotate_batch_torch(qt, R)
     return mu_w, qw, sc_w
 
 

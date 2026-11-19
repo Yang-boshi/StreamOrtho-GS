@@ -2,13 +2,18 @@ data:
   images: ""
   image_size: 512
   stride: 1
+  # 相机内参模式 (不依赖 config.cfg，可直接在此处配置):
+  #   auto     : 自动检测 (有 config.cfg 用它；否则读 EXIF；否则退化为无内参相对尺度)
+  #   provided : 使用下方 intrinsics_value [fx, fy, cx, cy]
+  #   exif     : 仅从图片 EXIF 焦距估算
+  #   none     : 无内参 (仅靠纯 RGB 图像运行)
   intrinsics: auto          # auto | exif | provided | none
-  intrinsics_value: null    # [fx, fy, cx, cy] when provided
+  intrinsics_value: null    # 示例: [1220.0, 1220.0, 960.0, 540.0]
   max_frames: 0
 
 frontend:
   backend: live                # images only: run the SLAM loop in-process
-  use_calib: "false"
+  use_calib: "auto"            # auto-use EXIF / config.cfg / provided intrinsics when available
   keyframe_policy: default
   single_thread: false
 
@@ -40,6 +45,28 @@ gaussian:
   keyframes_only: true
   anchor: head
   apply_filter: true
+  # True streaming 3DGS per-keyframe ortho + nadir consensus
+  streaming_3dgs: true
+  adaptive_stride: true
+  flat_stride: 1
+  edge_grad_pct: 70.0
+  depth_upsample: edge
+  edge_rel_tau: 0.03
+  edge_reject: 1
+  edge_pct: 95.0
+  voxel_gsd_mul: 1.0
+  nadir_replace_margin: 0.15
+  gsd_mul: 1.0
+  max_canvas_px: 6144
+  tile_halo: 16
+  # Final 3DGS output (when streaming_3dgs=true, produced directly from live map;
+  # when streaming_3dgs=false, runs offline P5.1c fallback)
+  final_enabled: true
+  gsd_3dgs: 0.0              # 0 = auto: native pixel footprint
+  conf_threshold: 0.5
+  blend_levels: 4
+  feather_radius: 24
+  max_kf: 0                  # 0 = every keyframe
 
 map:
   cell: 0.45
@@ -51,6 +78,8 @@ map:
   window_every: 5
   window_rounds: 2
   grid_cells: 2048
+  bootstrap_kfs: 3
+  progressive_align: true
 
 ortho:
   gsd: 0.30
@@ -59,12 +88,13 @@ ortho:
   fov_only: true
   dirty_tiles: true
   budget_ms: 500
-  max_tiles: 6
+  max_tiles: 24
   dump_every: 1
+  async_worker: true
   async_dump: true
-  dump_scale: 1.0
-  dump_format: png
-  dump_queue: 2
+  dump_scale: 0.5
+  dump_format: jpg
+  dump_queue: 8
   update_on: frame
   edge_pct: 85
   edge_dilate: 2

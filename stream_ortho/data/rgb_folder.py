@@ -22,16 +22,19 @@ import numpy as np
 def _list_images(root: pathlib.Path) -> List[pathlib.Path]:
     exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
     files = [p for p in root.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    if not files and (root / "rgb").is_dir():
+        files = [p for p in (root / "rgb").iterdir() if p.is_file() and p.suffix.lower() in exts]
     if not files:
         raise FileNotFoundError(f"no images in {root}")
 
     def key(p: pathlib.Path):
         stem = p.stem
-        return (0, int(stem), "") if stem.isdigit() else (1, 0, p.name)
+        try:
+            return (0, float(stem), "")
+        except ValueError:
+            return (1, 0.0, p.name)
 
     files.sort(key=key)
-    if not files[0].stem.isdigit():            # no numeric names: keep the name order
-        files.sort(key=lambda p: p.name)
     return files
 
 
@@ -86,6 +89,30 @@ class RGBFolderDataset:
         if load_images:
             self._imgs[0] = self.read_img(0)
 
+    def _calib_txt_intrinsics(self):
+        """Parse fx, fy, cx, cy from calib.txt in root or parent dir if present."""
+        import math
+        import re
+        for cand in (self.root / "calib.txt", self.root.parent / "calib.txt"):
+            if not cand.is_file():
+                continue
+            try:
+                vals = []
+                for line in cand.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    for tok in re.split(r"[,\s]+", line):
+                        if tok:
+                            vals.append(float(tok))
+                if len(vals) >= 4 and all(math.isfinite(v) for v in vals[:4]):
+                    fx, fy, cx, cy = vals[:4]
+                    if fx > 10.0 and fy > 10.0:
+                        return (fx, fy, cx, cy)
+            except Exception:
+                continue
+        return None
+
     def _set_intrinsics(self, intrinsics_value):
         H, W = self._hw
         self.intrinsics_source = "none"
@@ -95,16 +122,22 @@ class RGBFolderDataset:
             fx, fy, cx, cy = [float(v) for v in intrinsics_value]
             self.intrinsics_source, self.metric_scale = "provided", True
         elif self.intrinsics_mode in ("exif", "auto"):
-            f = exif_focal_px(self._f0, W)
-            if f:
-                fx = fy = f
-                cx, cy = W / 2.0, H / 2.0
-                self.intrinsics_source = "exif"
+            calib = self._calib_txt_intrinsics() if self.intrinsics_mode == "auto" else None
+            if calib is not None:
+                fx, fy, cx, cy = calib
+                self.intrinsics_source = "calib.txt"
                 self.metric_scale = True
             else:
-                fy, cx, cy = fx, W / 2.0, H / 2.0
-                self.intrinsics_source = "default"
-                self.metric_scale = False
+                f = exif_focal_px(self._f0, W)
+                if f:
+                    fx = fy = f
+                    cx, cy = W / 2.0, H / 2.0
+                    self.intrinsics_source = "exif"
+                    self.metric_scale = True
+                else:
+                    fy, cx, cy = fx, W / 2.0, H / 2.0
+                    self.intrinsics_source = "default"
+                    self.metric_scale = False
         else:                                   # none
             fy, cx, cy = fx, W / 2.0, H / 2.0
             self.intrinsics_source = "none"
@@ -135,14 +168,42 @@ class RGBFolderDataset:
         return self._imgs[int(fid)]
 
     def frame_shape(self) -> Tuple[int, int]:
+        H, W = self._hw
+        if self.image_size:
+            scale = float(self.image_size) / float(max(H, W))
+            w_r = max(int(round(W * scale)), 1)
+            h_r = max(int(round(H * scale)), 1)
+            # Match MASt3R-SLAM resize_img multiple-of-16 crop
+            w_f = ((w_r // 16) * 16) or w_r
+            h_f = ((h_r // 16) * 16) or h_r
+            return (h_f, w_f)
         return self._hw
 
     def get_img_shape(self):
-        return self._hw
+        return self.frame_shape()
+
+    def has_calib(self) -> bool:
+        return bool(self.metric_scale)
+
+    @property
+    def K_orig(self) -> np.ndarray:
+        return self._K
 
     @property
     def K_frame(self) -> np.ndarray:
         return self._K
+
+    def K_slam_frame(self) -> np.ndarray:
+        """Intrinsics scaled to the MASt3R resized frame shape."""
+        H, W = self._hw
+        hf, wf = self.frame_shape()
+        sx, sy = wf / float(W), hf / float(H)
+        K = self._K.copy()
+        K[0, 0] *= sx
+        K[1, 1] *= sy
+        K[0, 2] *= sx
+        K[1, 2] *= sy
+        return K
 
     @property
     def K(self) -> np.ndarray:

@@ -73,11 +73,25 @@ class GaussianCfg:
     apply_filter: bool = True
     # P5.1c: offline 3DGS final render (after streaming completes)
     final_enabled: bool = False         # render mosaic_final_3dgs after the run
-    gsd_3dgs: float = 0.0               # 0 = auto (one source pixel per keyframe)
+    gsd_3dgs: float = 0.0               # 0 = auto (native pixel footprint)
     conf_threshold: float = 0.5         # min head confidence for a gaussian
-    blend_levels: int = 4               # Laplacian pyramid depth
+    blend_levels: int = 4               # Laplacian pyramid depth (offline blend mode)
     feather_radius: int = 24            # blend feather width (canvas px)
     max_kf: int = 0                     # 0 = all keyframes; else first N (debug)
+    # Streaming 3DGS (true per-keyframe ortho rendering & nadir consensus)
+    streaming_3dgs: bool = False        # true = render 3DGS ortho on every keyframe
+    adaptive_stride: bool = True        # stride=1 on edges/textures, flat_stride on smooth areas
+    flat_stride: int = 2                # stride on homogeneous regions
+    edge_grad_pct: float = 70.0         # image gradient percentile promoted to stride=1
+    depth_upsample: str = "edge"        # edge | nearest | linear
+    edge_rel_tau: float = 0.03          # relative depth-jump threshold (scale-invariant)
+    edge_reject: int = 1                # depth-discontinuity curtain dilation radius (512px grid)
+    edge_pct: float = 95.0              # top inverse-depth gradient percentile culled as curtains
+    voxel_gsd_mul: float = 2.0          # voxel size = voxel_gsd_mul * gsd for nadir dedup
+    nadir_replace_margin: float = 0.08  # replace voxel winner when nadir_score improves by margin
+    gsd_mul: float = 1.0                # 1.0 = native image pixel GSD
+    max_canvas_px: int = 6144           # safety cap on mosaic longest side in pixels
+    tile_halo: int = 16                 # guard band (px) for seamless gsplat tile borders
 
 
 @dataclass
@@ -93,6 +107,8 @@ class MapCfg:
     #: live path: preallocated square product grid.  Without this the e2e build falls back to
     #: "first-frame bbox + 8 cells" and 84-93% of the later keyframes land outside it.
     grid_cells: int = 2048
+    bootstrap_kfs: int = 2              # initial frames before plane alignment is locked
+    progressive_align: bool = True      # per-keyframe local ground-normal & height rectification
 
 
 @dataclass
@@ -108,10 +124,12 @@ class OrthoCfg:
     edge_pct: float = 85.0
     edge_dilate: int = 2
     update_on: str = "frame"        # frame | keyframe
+    async_worker: bool = True       # decouple SLAM frontend from 3DGS mapping/tile flush
     async_dump: bool = True         # write mosaics on a background thread
     dump_scale: float = 0.5         # preview scale (final always 1.0)
     dump_format: str = "png"        # png | jpg
     dump_queue: int = 2             # bounded queue length
+    show: bool = False              # live OpenCV preview window (--show)
 
 
 @dataclass
@@ -223,6 +241,10 @@ def _validate(cfg: Config):
         raise ConfigError("map.max_layers must be >= 1")
     if cfg.ortho.gsd <= 0 or cfg.map.cell <= 0:
         raise ConfigError("ortho.gsd and map.cell must be positive")
+    if cfg.gaussian.depth_upsample not in ("edge", "nearest", "linear"):
+        raise ConfigError("gaussian.depth_upsample must be edge|nearest|linear")
+    if cfg.gaussian.flat_stride < 1:
+        raise ConfigError("gaussian.flat_stride must be >= 1")
 
 
 def override(cfg: Config, **kwargs) -> Config:

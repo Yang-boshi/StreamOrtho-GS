@@ -10,7 +10,7 @@ from stream_ortho.app.config import ConfigError, load_config, override
 def build_parser():
     ap = argparse.ArgumentParser(prog="stream_ortho.app.run",
                                  description="streaming feed-forward orthomapping")
-    ap.add_argument("--config", default="configs/default.yaml")
+    ap.add_argument("--config", default="configs/base.yaml")
     ap.add_argument("--images", default=None, help="RGB folder (overrides data.images)")
     ap.add_argument("--out", default="results/run_001")
     ap.add_argument("--max-frames", type=int, default=None)
@@ -32,6 +32,8 @@ def build_parser():
     ap.add_argument("--seq", default=None, help="sequence name (data.seq)")
     ap.add_argument("--oracle", default=None,
                     help="offline product npz used only for the quality comparison")
+    ap.add_argument("--show", action="store_true",
+                    help="open a live preview window updating as orthophoto tiles change")
     return ap
 
 
@@ -48,7 +50,7 @@ def main(argv=None):
                  data__intrinsics=a.intrinsics, data__intrinsics_value=iv,
                  data__seq=a.seq,
                  frontend__use_calib=("true" if a.calib else ("false" if a.no_calib else None)),
-                 ortho__gsd=a.gsd, map__cell=a.cell)
+                 ortho__gsd=a.gsd, ortho__show=(True if a.show else None), map__cell=a.cell)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2

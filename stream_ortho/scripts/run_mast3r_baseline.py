@@ -44,7 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="rgb: a plain image folder without config.cfg")
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--config", default=None, help="upstream yaml (default config/base.yaml)")
-    p.add_argument("--calib", action="store_true", help="use config.cfg intrinsics")
+    p.add_argument("--calib", action="store_true", help="use config.cfg / provided / exif intrinsics")
+    p.add_argument("--intrinsics", default="auto", choices=("auto", "exif", "provided", "none"),
+                   help="intrinsics source when dataset_format=rgb")
+    p.add_argument("--intrinsics-value", default=None,
+                   help="fx,fy,cx,cy when --intrinsics provided")
     p.add_argument("--max-frames", type=int, default=None)
     p.add_argument("--stride", type=int, default=1, help="image stride (after sorting)")
     p.add_argument("--img-downsample", type=int, default=1, help="upstream img_downsample")
@@ -70,9 +74,52 @@ def _sim3_vec(T_WC) -> np.ndarray:
 #: set by ``app.frontend.LiveFrontend`` to receive every committed keyframe in-process
 KEYFRAME_HOOK = None
 
+#: set by ``app.frontend.LiveFrontend`` to receive backend BA pose updates: fn(pose_dict)
+#: where pose_dict maps keyframe index k -> (8,) Sim3 vector.
+POSE_UPDATE_HOOK = None
+
+#: active MASt3R model reference for in-process feature/decoder reuse
+ACTIVE_MODEL = None
+
 
 def _frame_pose(frame) -> np.ndarray:
     return _sim3_vec(frame.T_WC)
+
+
+def _emit_pose_updates(keyframes, last_poses: dict, last_ver: int, force: bool = False) -> int:
+    """Check ``keyframes.pose_version`` and emit changed keyframe poses to POSE_UPDATE_HOOK."""
+    hook = POSE_UPDATE_HOOK
+    if hook is None:
+        return last_ver
+    cur_ver = keyframes.get_pose_version()
+    if not force and cur_ver == last_ver:
+        return cur_ver
+    n_kf = len(keyframes)
+    if n_kf == 0:
+        return cur_ver
+    with keyframes.lock:
+        T_all = keyframes.T_WC[:n_kf].detach().cpu().numpy().reshape(n_kf, -1).astype(np.float64)
+    changed = {}
+    for k in range(n_kf):
+        prev = last_poses.get(k)
+        if prev is None:
+            continue
+        vec = T_all[k]
+        dt = float(np.linalg.norm(vec[:3] - prev[:3]))
+        dq = float(np.linalg.norm(vec[3:7] - prev[3:7]))
+        ds = float(abs(vec[7] - prev[7]))
+        # During live streaming, ignore sub-pixel BA jitter (<0.005) to avoid
+        # redundant tile re-renders; force=True at end-of-stream syncs everything.
+        thresh = 1e-4 if force else 5e-3
+        if dt > thresh or dq > thresh or ds > thresh:
+            changed[k] = vec.copy()
+            last_poses[k] = vec.copy()
+    if changed:
+        try:
+            hook(changed)
+        except Exception as exc:
+            print(f"[pose-hook] {exc!r}", flush=True)
+    return cur_ver
 
 
 def run(args) -> dict:
@@ -82,6 +129,16 @@ def run(args) -> dict:
 
     # --- import upstream (read-only) ------------------------------------
     repo = compat.ensure_upstream_on_path()
+    # Ensure third_party/MASt3R-SLAM/checkpoints resolves so backend retrieval_database loads
+    up_ckpt = zcfg.MAST3R_SLAM_DIR / "checkpoints"
+    if (zcfg.CKPT_DIR / "mast3r").is_dir():
+        if up_ckpt.is_symlink() and not up_ckpt.exists():
+            up_ckpt.unlink()
+        if not up_ckpt.exists():
+            try:
+                up_ckpt.symlink_to(zcfg.CKPT_DIR / "mast3r")
+            except Exception:
+                pass
     compat.load_upstream_config(args.config)
     import main as ms_main  # upstream main.py, imported as a module
 
@@ -105,9 +162,12 @@ def run(args) -> dict:
     if args.dataset_format == "rgb":
         # a plain folder of images: RGBFolderDataset provides the same contract
         from stream_ortho.data.rgb_folder import RGBFolderDataset
+        iv = ([float(v) for v in args.intrinsics_value.split(",")]
+              if getattr(args, "intrinsics_value", None) else None)
+        intr_mode = args.intrinsics if config["use_calib"] else "none"
         dataset = RGBFolderDataset(
             dataset_dir, image_size=zcfg.IMG_SIZE, stride=args.stride,
-            intrinsics=("auto" if config["use_calib"] else "none"),
+            intrinsics=intr_mode, intrinsics_value=iv,
             max_frames=args.max_frames)
     else:
         dataset = NPUDroneMapDataset(
@@ -126,21 +186,35 @@ def run(args) -> dict:
     h, w = (_shape[0] if isinstance(_shape[0], (tuple, list)) else _shape)
     print(f"[S2] keyframe frame size h,w = {int(h)},{int(w)}")
 
+    kf_buf = min(int(args.kf_buffer), max(64, len(dataset) + 8))
+    print(f"[S2] SharedKeyframes buffer={kf_buf} (requested={args.kf_buffer}, frames={len(dataset)})")
     ctx = mp.get_context("spawn")
     manager = ctx.Manager()
-    keyframes = SharedKeyframes(manager, h, w, buffer=args.kf_buffer)
+    keyframes = SharedKeyframes(manager, h, w, buffer=kf_buf)
     states = SharedStates(manager, h, w)
 
+    global ACTIVE_MODEL
     model = load_mast3r(str(zcfg.MAST3R_CKPT), device=device)
     model.share_memory()
+    ACTIVE_MODEL = model
 
     use_calib = bool(config["use_calib"])
     K = None
     if use_calib:
-        if not dataset.has_calib():
-            raise SystemExit("use_calib=True 但数据集没有内参")
-        K = torch.from_numpy(dataset.camera_intrinsics.K_frame).to(device, dtype=torch.float32)
-        keyframes.set_intrinsics(K)
+        if hasattr(dataset, "has_calib") and not dataset.has_calib():
+            print("[S2] warning: use_calib=True requested, but dataset has no metric calib; "
+                  "falling back to use_calib=False", flush=True)
+            use_calib = False
+            config["use_calib"] = False
+        else:
+            if getattr(dataset, "camera_intrinsics", None) is not None:
+                K_np = dataset.camera_intrinsics.K_frame
+            elif hasattr(dataset, "K_slam_frame"):
+                K_np = dataset.K_slam_frame()
+            else:
+                K_np = dataset.K_frame()
+            K = torch.from_numpy(np.asarray(K_np)).to(device, dtype=torch.float32)
+            keyframes.set_intrinsics(K)
 
     tracker = FrameTracker(model, keyframes, device)
     backend = ctx.Process(
@@ -158,6 +232,12 @@ def run(args) -> dict:
     torch.cuda.reset_peak_memory_stats()
     frames_to_save = []
     stats = {"n_reloc": 0, "n_kf": 0}
+    last_poses = {}
+    seen_pose_ver = 0
+    emitted_kf_idx = 0
+    ds_img_size = (int(dataset.img_size[0])
+                   if isinstance(dataset.img_size, (tuple, list))
+                   else int(dataset.img_size))
 
     while True:
         mode = states.get_mode()
@@ -167,12 +247,14 @@ def run(args) -> dict:
             break
 
         timestamp, img = dataset[i]
+        if isinstance(img, torch.Tensor) and img.ndim == 3 and img.shape[0] in (1, 3):
+            img = img.permute(1, 2, 0).cpu().numpy()
         T_WC = (
             lietorch.Sim3.Identity(1, device=device)
             if i == 0
             else states.get_frame().T_WC
         )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        frame = create_frame(i, img, T_WC, img_size=ds_img_size, device=device)
 
         if args.save_frames and i < args.save_frames:
             frames_to_save.append((i, np.asarray(img)))
@@ -185,7 +267,6 @@ def run(args) -> dict:
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
-            _emit_keyframe(0, frame)
             add_new_kf = False
         elif mode == Mode.TRACKING:
             t0 = time.time()
@@ -197,13 +278,21 @@ def run(args) -> dict:
             states.set_frame(frame)
             if add_new_kf:
                 keyframes.append(frame)
+                kf_idx = len(keyframes) - 1
                 stats["n_kf"] += 1
-                states.queue_global_optimization(len(keyframes) - 1)
-                _emit_keyframe(len(keyframes) - 1, frame)
+                states.queue_global_optimization(kf_idx)
+                # Emit previous keyframe(s) now that their multi-view tracking window
+                # has completed and X_canon has fused N=5..24 stereo observations.
+                while emitted_kf_idx < kf_idx:
+                    kf_ready = keyframes[emitted_kf_idx]
+                    last_poses[emitted_kf_idx] = _frame_pose(kf_ready)
+                    _emit_keyframe(emitted_kf_idx, kf_ready)
+                    emitted_kf_idx += 1
             if config["single_thread"]:
                 with states.lock:
                     while len(states.global_optimizer_tasks) > 0:
                         pass
+            seen_pose_ver = _emit_pose_updates(keyframes, last_poses, seen_pose_ver)
             timing_rows.append((i, float(timestamp), dt, int(bool(add_new_kf))))
         elif mode == Mode.RELOC:
             t0 = time.time()
@@ -233,12 +322,30 @@ def run(args) -> dict:
             free, total = torch.cuda.mem_get_info()
             device_mem.append((i, (total - free) / 1e6))
         if i % 25 == 0:
+            if torch.cuda.is_available():
+                if (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > 192 * 1024 * 1024:
+                    torch.cuda.empty_cache()
             elapsed = time.time() - t_start
             print(
                 f"[S2] frame {i:4d}/{len(dataset)}  kf={len(keyframes):3d}  "
                 f"mode={mode}  {i / max(elapsed, 1e-9):5.2f} fps"
             )
         i += 1
+
+    # --- flush final keyframe(s) and drain backend BA before terminating ---
+    while emitted_kf_idx < len(keyframes):
+        kf_ready = keyframes[emitted_kf_idx]
+        last_poses[emitted_kf_idx] = _frame_pose(kf_ready)
+        _emit_keyframe(emitted_kf_idx, kf_ready)
+        emitted_kf_idx += 1
+    drain_t0 = time.time()
+    while time.time() - drain_t0 < 15.0:
+        with states.lock:
+            pending = len(states.global_optimizer_tasks)
+        if pending == 0:
+            break
+        time.sleep(0.02)
+    _emit_pose_updates(keyframes, last_poses, seen_pose_ver, force=True)
 
     # --- stop backend ---------------------------------------------------
     states.set_mode(Mode.TERMINATED)
@@ -331,10 +438,12 @@ def run(args) -> dict:
                 Nupd[k] = 1
             fids[k] = int(kf.frame_id)
             tss[k] = float(dataset.timestamps[kf.frame_id])
+        k_save = (dataset.K_slam_frame() if hasattr(dataset, "K_slam_frame")
+                  else (dataset.K_frame() if callable(dataset.K_frame) else dataset.K_frame))
         np.savez(
             out_dir / "keyframes.npz",
             X_canon=X, C=C, N=Nupd, T_WC=T, frame_id=fids, timestamp=tss,
-            K=dataset.K_frame(), hw=np.array([kh, kw]),
+            K=k_save, hw=np.array([kh, kw]),
             use_calib=np.array([use_calib]),
         )
         stats["sim3_scale"] = {

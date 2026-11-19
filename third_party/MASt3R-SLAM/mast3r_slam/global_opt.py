@@ -118,6 +118,19 @@ class FactorGraph:
 
         return Xs, T_WCs, Cs
 
+    @staticmethod
+    def _run_gn_with_cache_guard(fn, *args):
+        """Run a C++/CUDA Gauss-Newton solver with allocator cache hygiene."""
+        if torch.cuda.is_available() and (
+            torch.cuda.memory_reserved() - torch.cuda.memory_allocated() > 128 * 1024 * 1024
+        ):
+            torch.cuda.empty_cache()
+        try:
+            return fn(*args)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            return fn(*args)
+
     def solve_GN_rays(self):
         pin = self.cfg["pin"]
         unique_kf_idx = self.get_unique_kf_idx()
@@ -137,7 +150,8 @@ class FactorGraph:
         delta_thresh = self.cfg["delta_norm"]
 
         pose_data = T_WCs.data[:, 0, :]
-        mast3r_slam_backends.gauss_newton_rays(
+        self._run_gn_with_cache_guard(
+            mast3r_slam_backends.gauss_newton_rays,
             pose_data,
             Xs,
             Cs,
@@ -187,7 +201,8 @@ class FactorGraph:
         img_size = self.frames[0].img.shape[-2:]
         height, width = img_size
 
-        mast3r_slam_backends.gauss_newton_calib(
+        self._run_gn_with_cache_guard(
+            mast3r_slam_backends.gauss_newton_calib,
             pose_data,
             Xs,
             Cs,

@@ -74,13 +74,15 @@ def _save_rgba(path: pathlib.Path, rgb, alpha, fmt: str = "png", scale: float = 
     tmp = path.with_suffix(path.suffix + ".tmp")
     if fmt.lower() in ("jpg", "jpeg"):
         im = Image.fromarray((rgb * 255).astype(np.uint8), mode="RGB")
-        pil_fmt = "JPEG"
+        im.save(tmp, format="JPEG", quality=92)
     else:
-        im = Image.fromarray((np.concatenate([rgb, a[..., None]], -1) * 255).astype(np.uint8),
+        # RGB is already alpha-un-premultiplied by gsplat_ortho; keep covered pixels opaque
+        # so image viewers do not double-darken semi-transparent areas.
+        a_out = np.where(a > 0.02, 1.0, 0.0).astype(np.float32)
+        im = Image.fromarray((np.concatenate([rgb, a_out[..., None]], -1) * 255).astype(np.uint8),
                              mode="RGBA")
-        pil_fmt = "PNG"
-    # pass the format explicitly: the atomic temp name ends in ".tmp" and PIL cannot infer it
-    im.save(tmp, format=pil_fmt)
+        # Fast zlib level 1 keeps async preview PNG dumps non-blocking
+        im.save(tmp, format="PNG", compress_level=1)
     os.replace(tmp, path)
 
 
